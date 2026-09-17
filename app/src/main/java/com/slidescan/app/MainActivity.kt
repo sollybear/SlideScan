@@ -39,7 +39,7 @@ class MainActivity : AppCompatActivity() {
             scanning = !scanning
             binding.startStopButton.text = if (scanning) "STOP SCANNING" else "START SCANNING"
             binding.statusText.text = if (scanning) "Watching for the next stable slide…" else "Paused."
-            candidateSignature = null
+            candidateSignature = null; candidateSince = 0L
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera() else permission.launch(Manifest.permission.CAMERA)
     }
@@ -61,22 +61,35 @@ class MainActivity : AppCompatActivity() {
         if (!scanning) { image.close(); return }
         val sig = luminanceSignature(image); image.close()
         val previous = lastSignature
+        val now = System.currentTimeMillis()
         if (previous == null) {
-            candidateSignature = sig
-            if (candidateSince == 0L) candidateSince = System.currentTimeMillis()
-            if (System.currentTimeMillis() - candidateSince > 1000) capture(sig)
+            if (candidateSignature == null) { candidateSignature = sig; candidateSince = now }
+            else if (distance(candidateSignature!!, sig) < 0.018 && now - candidateSince > 450) capture(sig)
+            else if (distance(candidateSignature!!, sig) >= 0.018) { candidateSignature = sig; candidateSince = now }
             return
         }
+
         val difference = distance(previous, sig)
-        val threshold = binding.sensitivity.progress.coerceAtLeast(4) / 100.0
-        val now = System.currentTimeMillis()
-        if (difference > threshold && now - lastCaptureAt > 1200) {
+        // Slider semantics are intuitive now: higher slider = lower trigger threshold.
+        // Range is ~1.2% (most sensitive) to ~4.0% (least sensitive).
+        val slider = binding.sensitivity.progress.coerceIn(0, 20)
+        val threshold = 0.040 - (slider * 0.0014)
+
+        if (difference >= threshold && now - lastCaptureAt > 650) {
             val candidate = candidateSignature
-            if (candidate == null || distance(candidate, sig) > 0.025) {
+            if (candidate == null) {
                 candidateSignature = sig; candidateSince = now
-                runOnUiThread { binding.statusText.text = "Change detected — waiting for slide to settle…" }
-            } else if (now - candidateSince > 700) capture(sig)
-        } else {
+                runOnUiThread { binding.statusText.text = "Slide change detected…" }
+            } else {
+                val stability = distance(candidate, sig)
+                if (stability <= 0.018) {
+                    if (now - candidateSince >= 350) capture(sig)
+                } else {
+                    // The transition/animation is still moving. Follow it until it settles.
+                    candidateSignature = sig; candidateSince = now
+                }
+            }
+        } else if (difference < threshold * 0.65) {
             candidateSignature = null; candidateSince = 0L
             runOnUiThread { binding.statusText.text = "Watching for the next stable slide…" }
         }
@@ -85,7 +98,7 @@ class MainActivity : AppCompatActivity() {
     private fun luminanceSignature(image: ImageProxy): IntArray {
         val plane = image.planes[0]; val buffer = plane.buffer
         val rowStride = plane.rowStride; val pixelStride = plane.pixelStride
-        val w = image.width; val h = image.height; val gridX = 16; val gridY = 9
+        val w = image.width; val h = image.height; val gridX = 32; val gridY = 18
         val out = IntArray(gridX * gridY)
         for (gy in 0 until gridY) for (gx in 0 until gridX) {
             val x = ((gx + .5) * w / gridX).toInt().coerceIn(0, w - 1)
