@@ -64,32 +64,31 @@ class MainActivity : AppCompatActivity() {
         val now = System.currentTimeMillis()
         if (previous == null) {
             if (candidateSignature == null) { candidateSignature = sig; candidateSince = now }
-            else if (distance(candidateSignature!!, sig) < 0.018 && now - candidateSince > 450) capture(sig)
-            else if (distance(candidateSignature!!, sig) >= 0.018) { candidateSignature = sig; candidateSince = now }
+            else if (distance(candidateSignature!!, sig) < 0.012 && now - candidateSince > 300) capture(sig)
+            else if (distance(candidateSignature!!, sig) >= 0.012) { candidateSignature = sig; candidateSince = now }
             return
         }
 
         val difference = distance(previous, sig)
-        // Slider semantics are intuitive now: higher slider = lower trigger threshold.
-        // Range is ~1.2% (most sensitive) to ~4.0% (least sensitive).
+        // Aggressive detection: at maximum sensitivity a ~0.35% average frame change can trigger.
+        // Even the least-sensitive setting is more responsive than the previous default.
         val slider = binding.sensitivity.progress.coerceIn(0, 20)
-        val threshold = 0.040 - (slider * 0.0014)
+        val threshold = 0.018 - (slider * 0.000725)
 
-        if (difference >= threshold && now - lastCaptureAt > 650) {
+        if (difference >= threshold && now - lastCaptureAt > 450) {
             val candidate = candidateSignature
             if (candidate == null) {
                 candidateSignature = sig; candidateSince = now
                 runOnUiThread { binding.statusText.text = "Slide change detected…" }
             } else {
                 val stability = distance(candidate, sig)
-                if (stability <= 0.018) {
-                    if (now - candidateSince >= 350) capture(sig)
+                if (stability <= 0.012) {
+                    if (now - candidateSince >= 220) capture(sig)
                 } else {
-                    // The transition/animation is still moving. Follow it until it settles.
                     candidateSignature = sig; candidateSince = now
                 }
             }
-        } else if (difference < threshold * 0.65) {
+        } else if (difference < threshold * 0.45) {
             candidateSignature = null; candidateSince = 0L
             runOnUiThread { binding.statusText.text = "Watching for the next stable slide…" }
         }
@@ -98,7 +97,7 @@ class MainActivity : AppCompatActivity() {
     private fun luminanceSignature(image: ImageProxy): IntArray {
         val plane = image.planes[0]; val buffer = plane.buffer
         val rowStride = plane.rowStride; val pixelStride = plane.pixelStride
-        val w = image.width; val h = image.height; val gridX = 32; val gridY = 18
+        val w = image.width; val h = image.height; val gridX = 48; val gridY = 27
         val out = IntArray(gridX * gridY)
         for (gy in 0 until gridY) for (gx in 0 until gridX) {
             val x = ((gx + .5) * w / gridX).toInt().coerceIn(0, w - 1)
