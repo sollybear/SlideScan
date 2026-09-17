@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
+import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -28,6 +29,8 @@ class MainActivity : AppCompatActivity() {
     private var candidateSignature: IntArray? = null
     private var candidateSince = 0L
     private var lastCaptureAt = 0L
+    private var armed = true
+    private var rearmSince = 0L
     private var imageCapture: ImageCapture? = null
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) startCamera() else binding.statusText.text = "Camera permission is required." }
 
@@ -39,7 +42,9 @@ class MainActivity : AppCompatActivity() {
             scanning = !scanning
             binding.startStopButton.text = if (scanning) "STOP SCANNING" else "START SCANNING"
             binding.statusText.text = if (scanning) "Watching for the next stable slide…" else "Paused."
-            candidateSignature = null; candidateSince = 0L
+            candidateSignature = null; candidateSince = 0L; armed = true; rearmSince = 0L
+            if (scanning) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera() else permission.launch(Manifest.permission.CAMERA)
     }
@@ -62,6 +67,7 @@ class MainActivity : AppCompatActivity() {
         val sig = luminanceSignature(image); image.close()
         val previous = lastSignature
         val now = System.currentTimeMillis()
+
         if (previous == null) {
             if (candidateSignature == null) { candidateSignature = sig; candidateSince = now }
             else if (distance(candidateSignature!!, sig) < 0.012 && now - candidateSince > 300) capture(sig)
@@ -69,13 +75,26 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val difference = distance(previous, sig)
-        // Aggressive detection: at maximum sensitivity a ~0.35% average frame change can trigger.
-        // Even the least-sensitive setting is more responsive than the previous default.
         val slider = binding.sensitivity.progress.coerceIn(0, 20)
-        val threshold = 0.018 - (slider * 0.000725)
+        val globalThreshold = 0.018 - (slider * 0.000725)
+        val tileThreshold = 0.030 - (slider * 0.0009)
+        val globalDiff = distance(previous, sig)
+        val changedTileRatio = changedTileRatio(previous, sig, tileThreshold)
+        val meaningfulChange = globalDiff >= globalThreshold || changedTileRatio >= 0.035
 
-        if (difference >= threshold && now - lastCaptureAt > 450) {
+        // After a capture, don't allow a second capture until the camera has remained close
+        // to the captured state for a short period. This rejects exposure/focus settling and
+        // transition tails that previously caused double captures.
+        if (!armed) {
+            val settled = globalDiff < globalThreshold * 0.45 && changedTileRatio < 0.018
+            if (settled) {
+                if (rearmSince == 0L) rearmSince = now
+                if (now - rearmSince >= 650) { armed = true; rearmSince = 0L }
+            } else rearmSince = 0L
+            return
+        }
+
+        if (meaningfulChange && now - lastCaptureAt > 550) {
             val candidate = candidateSignature
             if (candidate == null) {
                 candidateSignature = sig; candidateSince = now
@@ -83,12 +102,12 @@ class MainActivity : AppCompatActivity() {
             } else {
                 val stability = distance(candidate, sig)
                 if (stability <= 0.012) {
-                    if (now - candidateSince >= 220) capture(sig)
+                    if (now - candidateSince >= 240) capture(sig)
                 } else {
                     candidateSignature = sig; candidateSince = now
                 }
             }
-        } else if (difference < threshold * 0.45) {
+        } else if (!meaningfulChange) {
             candidateSignature = null; candidateSince = 0L
             runOnUiThread { binding.statusText.text = "Watching for the next stable slide…" }
         }
@@ -107,11 +126,31 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
-    private fun distance(a: IntArray, b: IntArray): Double { var sum = 0.0; for (i in a.indices) sum += abs(a[i] - b[i]) / 255.0; return sum / a.size }
+    private fun distance(a: IntArray, b: IntArray): Double {
+        var sum = 0.0
+        for (i in a.indices) sum += abs(a[i] - b[i]) / 255.0
+        return sum / a.size
+    }
+
+    private fun changedTileRatio(a: IntArray, b: IntArray, threshold: Double): Double {
+        // 48x27 samples are grouped into 3x3 blocks => 16x9 spatial tiles.
+        // A small text-heavy area can therefore trigger without needing to move the whole-frame average.
+        var changed = 0; var tiles = 0
+        for (ty in 0 until 9) for (tx in 0 until 16) {
+            var sum = 0.0
+            for (dy in 0 until 3) for (dx in 0 until 3) {
+                val i = (ty * 3 + dy) * 48 + (tx * 3 + dx)
+                sum += abs(a[i] - b[i]) / 255.0
+            }
+            if (sum / 9.0 >= threshold) changed++
+            tiles++
+        }
+        return changed.toDouble() / tiles
+    }
 
     private fun capture(signature: IntArray) {
         val capture = imageCapture ?: return
-        lastCaptureAt = System.currentTimeMillis(); candidateSignature = null; candidateSince = 0L
+        lastCaptureAt = System.currentTimeMillis(); candidateSignature = null; candidateSince = 0L; armed = false; rearmSince = 0L
         capture.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 try {
@@ -120,7 +159,7 @@ class MainActivity : AppCompatActivity() {
                     val corrected = centerCrop16x9(bitmap, 1920, 1080)
                     saveBitmap(corrected); bitmap.recycle(); if (corrected !== bitmap) corrected.recycle()
                     lastSignature = signature; count++; confirm()
-                } catch (e: Exception) { image.close(); runOnUiThread { binding.statusText.text = "Capture failed: ${e.message}" } }
+                } catch (e: Exception) { image.close(); armed = true; runOnUiThread { binding.statusText.text = "Capture failed: ${e.message}" } }
             }
         })
     }
@@ -139,5 +178,5 @@ class MainActivity : AppCompatActivity() {
         contentResolver.openOutputStream(uri).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it!!) }
     }
 
-    private fun confirm() { runOnUiThread { binding.countText.text = "Captured: $count"; binding.statusText.text = "Slide $count captured ✓ — move to the next slide."; ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90).startTone(ToneGenerator.TONE_PROP_BEEP, 180); (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(VibrationEffect.createOneShot(120, VibrationEffect.DEFAULT_AMPLITUDE)) } }
+    private fun confirm() { runOnUiThread { binding.countText.text = "Captured: $count"; binding.statusText.text = "Slide $count captured ✓ — readying next capture."; ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90).startTone(ToneGenerator.TONE_PROP_BEEP, 180); (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(VibrationEffect.createOneShot(120, VibrationEffect.DEFAULT_AMPLITUDE)) } }
 }
